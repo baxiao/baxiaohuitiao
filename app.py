@@ -12,9 +12,6 @@ import threading
 # ==========================================
 try:
     SYS_PASSWORD = st.secrets["STOCK_SCAN_PWD"]
-except Exception:
-    # 如果 Secrets 未配置，默认密码为 wen666
-    SYS_PASSWORD = "wen666"
 
 # ==========================================
 # 2. 核心选股逻辑类
