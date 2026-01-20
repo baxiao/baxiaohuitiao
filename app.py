@@ -7,8 +7,8 @@ import io
 from datetime import datetime, timedelta, timezone
 import random
 
-# --- 1. 配置与安全 (严格遵循母版) ---
-st.set_page_config(page_title="游资核心追踪-13日回调版", layout="wide")
+# --- 1. 配置与安全 (回归初心版) ---
+st.set_page_config(page_title="13日回调-原始接口版", layout="wide")
 
 def check_password():
     if "password_correct" not in st.session_state:
@@ -17,9 +17,6 @@ def check_password():
         pwd = st.text_input("请输入访问令牌", type="password")
         if st.button("验证登录"):
             target_pwd = st.secrets.get("STOCK_SCAN_PWD")
-            if target_pwd is None:
-                st.error("配置错误：请在 Secrets 中设置 STOCK_SCAN_PWD")
-                return False
             if pwd == target_pwd:
                 st.session_state["password_correct"] = True
                 st.rerun()
@@ -35,70 +32,66 @@ def get_beijing_time():
     return datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
 
 def is_limit_up(close, pre_close):
+    """主板涨停判定逻辑"""
     if pd.isna(pre_close) or pre_close == 0: return False
     return close >= round(pre_close * 1.10 - 0.01, 2)
 
 def process_single_stock(code, name, current_price, turnover_rate, sector_info):
     try:
-        # 获取数据
-        hist = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq").tail(40)
-        if hist is None or len(hist) < 25: return None
+        # 使用原始历史数据接口
+        df = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq").tail(30)
+        if df is None or len(df) < 25: return None
         
-        hist = hist.reset_index(drop=True)
-        hist['pre_close'] = hist['收盘'].shift(1)
-        hist['is_zt'] = hist.apply(lambda x: is_limit_up(x['收盘'], x['pre_close']), axis=1)
+        df = df.reset_index(drop=True)
+        df.columns = ['日期', '开盘', '收盘', '最高', '最低', '成交量', '成交额', '振幅', '涨跌幅', '涨跌额', '换手率']
+        df['pre_close'] = df['收盘'].shift(1)
+        df['is_zt'] = df.apply(lambda x: is_limit_up(x['收盘'], x['pre_close']), axis=1)
         
-        # --- 严格13天判定逻辑 ---
-        # -1是今天, -14是13个交易日前
-        target_idx = len(hist) - 14
+        # 严格定位：今天(-1)往前数第13天回调(-14是那根涨停阳线)
+        target_idx = len(df) - 14
         if target_idx < 0: return None
         
-        # 判定: 必须是13天前那一根【刚好】是涨停阳线
-        # 如果13天前不是涨停，或者14天前也是涨停(导致回调天数变多)，则不符合“仅”13天
-        is_target_day_zt = hist.loc[target_idx, 'is_zt']
-        
-        if is_target_day_zt and hist.loc[target_idx, '收盘'] > hist.loc[target_idx, '开盘']:
+        # 必须是13天前那根刚好是涨停阳线
+        if df.loc[target_idx, 'is_zt'] and df.loc[target_idx, '收盘'] > df.loc[target_idx, '开盘']:
             
-            # 统计从13天前那根之后，到今天为止的涨停数
-            after_slice = hist.loc[target_idx + 1 :, 'is_zt']
+            # 统计那根阳线之后到今天的涨停总数
+            after_slice = df.loc[target_idx + 1 :, 'is_zt']
             zt_count_after = after_slice.sum()
             
             res_type = ""
-            # 功能1：10天内双停，首根后回调13天
+            # 功能1：10天内双涨停
             if zt_count_after > 0:
-                # 检查首根后的10个交易日内是否有第二根
-                ten_day_window = hist.loc[target_idx + 1 : target_idx + 10, 'is_zt']
+                ten_day_window = df.loc[target_idx + 1 : target_idx + 10, 'is_zt']
                 if ten_day_window.any():
                     res_type = "10天双涨停-回调13天"
             
-            # 功能2：单次涨停，隔日起回调13天
+            # 功能2：单次涨停
             if not res_type and zt_count_after == 0:
                 res_type = "单次涨停-回调13天"
             
-            # 如果符合，且【今天】不是涨停（回调必须是持续状态，今天若涨停则叫反弹起始，不录入）
-            if res_type and not hist.iloc[-1]['is_zt']:
+            # 且今天处于回调状态（今日未涨停）
+            if res_type and not df.iloc[-1]['is_zt']:
                 return {
                     "代码": code, "名称": name, "当前价格": current_price, "换手率": turnover_rate,
-                    "判定强度": res_type, "智能决策": "精准13日回调点：建议关注分时放量信号",
+                    "判定强度": res_type, "智能决策": "精准13日回调，关注止跌企稳",
                     "所属板块": sector_info, "查询时间": get_beijing_time()
                 }
     except: return None
     return None
 
-# --- 3. 页面渲染 (稳定性优化版) ---
+# --- 3. 页面渲染 (返回前两个版本接口架构) ---
 
 if check_password():
-    st.title("🚀 游资核心追踪 (13日回调授权版)")
+    st.title("🚀 游资核心追踪 (原始接口还原版)")
 
-    @st.cache_data(ttl=3600)
-    def get_safe_sectors():
-        for _ in range(3):
-            try:
-                return ak.stock_board_industry_name_em()['板块名称'].tolist()
-            except: time.sleep(1)
-        return []
+    # 返回版本1/2的行业板块获取方式
+    with st.spinner("同步板块数据..."):
+        try:
+            # 原始接口：获取行业板块
+            all_sectors = ak.stock_board_industry_name_em()['板块名称'].tolist()
+        except:
+            all_sectors = []
 
-    all_sectors = get_safe_sectors()
     selected_sector = st.sidebar.selectbox("选择查询范围", ["全市场扫描"] + all_sectors)
     thread_count = st.sidebar.slider("并发线程数", 1, 30, 20)
     
@@ -106,35 +99,32 @@ if check_password():
         if 'scan_results' in st.session_state:
             del st.session_state['scan_results']
             
+        # 倒计时模块
         countdown = st.empty()
         for i in range(3, 0, -1):
             countdown.metric("极速引擎正在预热...", f"{i} 秒")
             time.sleep(1)
         countdown.empty()
 
-        with st.spinner("正在安全连接行情接口..."):
-            df_pool = None
-            for _ in range(5):
-                try:
-                    if selected_sector == "全市场扫描":
-                        df_pool = ak.stock_zh_a_spot_em()
-                    else:
-                        df_pool = ak.stock_board_industry_cons_em(symbol=selected_sector)
-                    if df_pool is not None: break
-                except: time.sleep(2)
+        with st.spinner("正在抓取原始列表..."):
+            # 返回原始版本接口获取股票列表
+            if selected_sector == "全市场扫描":
+                # 原始接口：A股代码名称列表
+                df_pool = ak.stock_info_a_code_name()
+                # 补充最新价格和换手率（原始版逻辑）
+                spot_df = ak.stock_zh_a_spot_em()
+                df_pool = pd.merge(df_pool, spot_df[['代码', '最新价', '换手率']], left_on='code', right_on='代码', how='left')
+            else:
+                df_pool = ak.stock_board_industry_cons_em(symbol=selected_sector)
             
-            if df_pool is None:
-                st.error("数据接口繁忙，请等待1分钟后重试")
-                st.stop()
-
-            # 严格过滤：剔除ST、创业板、科创板
+            # 剔除ST、创业板、科创板
             df_pool = df_pool[~df_pool['名称'].str.contains("ST|退市")]
             df_pool = df_pool[~df_pool['代码'].str.startswith(("30", "68", "9"))]
             df_pool = df_pool[df_pool['换手率'] >= 3.0]
 
         stocks_to_check = df_pool[['代码', '名称', '最新价', '换手率']].values.tolist()
         total_stocks = len(stocks_to_check)
-        st.info(f"📊 待扫池：{total_stocks} 只")
+        st.info(f"📊 待扫标的：{total_stocks} 只")
         
         progress_bar = st.progress(0.0)
         status_text = st.empty()
@@ -148,11 +138,11 @@ if check_password():
                     results.append(res)
                     st.toast(f"✅ 捕获: {res['名称']}")
                 
-                if (i + 1) % 20 == 0 or (i+1) == total_stocks:
+                if (i + 1) % 10 == 0 or (i+1) == total_stocks:
                     progress_bar.progress(float((i + 1) / total_stocks))
                     status_text.text(f"🚀 扫描进度: {i+1}/{total_stocks}")
 
-        status_text.success(f"✨ 扫描完成！仅录入第13日回调股：{len(results)} 只")
+        status_text.success(f"✨ 扫描完成！共发现 {len(results)} 只标的")
         st.session_state['scan_results'] = results
 
     # 结果展示
@@ -160,11 +150,12 @@ if check_password():
         res_df = pd.DataFrame(st.session_state['scan_results'])
         res_df.insert(0, '序号', range(1, len(res_df) + 1))
         st.divider()
+        # 序号居中，文字直接展示
         st.dataframe(res_df.style.set_properties(**{'text-align': 'center'}), use_container_width=True, hide_index=True)
 
         output = io.BytesIO()
         res_df.to_excel(output, index=False)
-        st.download_button(label="📥 导出 Excel", data=output.getvalue(), file_name=f"13日回调_{datetime.now().strftime('%m%d')}.xlsx")
+        st.download_button(label="📥 导出 Excel", data=output.getvalue(), file_name=f"原始接口选股_{datetime.now().strftime('%m%d')}.xlsx")
 
     st.divider()
-    st.caption("Master Copy | 严格仅限13天回调 | 稳定性增强版")
+    st.caption("Master Copy | 原始接口还原版 | 严格仅限13天回调")
