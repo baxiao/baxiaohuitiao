@@ -1,164 +1,184 @@
 import streamlit as st
 import pandas as pd
 import akshare as ak
-import datetime
-import os
 import time
-import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import threading
+import io
+from datetime import datetime, timedelta, timezone
+import random
 
-# ==========================================
-# 1. 基础配置与安全 (仅从 Secrets 读取)
-# ==========================================
-if "STOCK_SCAN_PWD" in st.secrets:
-    SYS_PASSWORD = st.secrets["STOCK_SCAN_PWD"]
-else:
-    st.error("❌ 系统配置错误：请在 Streamlit 控制台的 Secrets 中设置 'STOCK_SCAN_PWD'。")
-    st.stop()
+# --- 1. 配置与安全 ---
+st.set_page_config(page_title="13日回调精准选股系统", layout="wide")
 
-# ==========================================
-# 2. 核心选股逻辑类
-# ==========================================
-class StockStrategy:
-    def __init__(self):
-        self.results = []
-        self.lock = threading.Lock()
+def check_password():
+    if "password_correct" not in st.session_state:
+        st.session_state["password_correct"] = False
+    if not st.session_state["password_correct"]:
+        pwd = st.text_input("请输入访问令牌", type="password")
+        if st.button("验证登录"):
+            # 优先从 Secrets 读取，符合母版安全要求
+            target_pwd = st.secrets.get("STOCK_SCAN_PWD", "888888")
+            if pwd == target_pwd:
+                st.session_state["password_correct"] = True
+                st.rerun()
+            else:
+                st.error("令牌错误")
+        return False
+    return True
 
-    def is_limit_up(self, close, pre_close):
-        """主板涨停判断：10%"""
-        if pd.isna(pre_close) or pre_close == 0: return False
-        return close >= round(pre_close * 1.10 - 0.01, 2)
+# --- 2. 核心判定逻辑 ---
 
-    def analyze(self, code, name):
-        try:
-            # 加入微小随机延迟，防止并发过高被封
-            time.sleep(random.uniform(0.1, 0.3))
+def get_beijing_time():
+    tz = timezone(timedelta(hours=8))
+    return datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+
+def is_limit_up(close, pre_close):
+    """主板涨停判定"""
+    if pd.isna(pre_close) or pre_close == 0: return False
+    return close >= round(pre_close * 1.10 - 0.01, 2)
+
+def process_single_stock(code, name, current_price, turnover_rate, sector_info):
+    try:
+        # 获取最近40天数据，确保有足够跨度计算13天回调
+        hist = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq").tail(40)
+        if len(hist) < 25: return None
+        
+        hist = hist.reset_index(drop=True)
+        hist['pre_close'] = hist['收盘'].shift(1)
+        hist['is_zt'] = hist.apply(lambda x: is_limit_up(x['收盘'], x['pre_close']), axis=1)
+        
+        # 定位13天前的索引 (Python索引-14是13天前，-1是今天)
+        target_idx = len(hist) - 14
+        if target_idx < 0: return None
+        
+        # 检查13天前是否是涨停阳线
+        if hist.loc[target_idx, 'is_zt'] and hist.loc[target_idx, '收盘'] > hist.loc[target_idx, '开盘']:
             
-            # 获取最近30个交易日数据
-            df = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq").tail(30)
-            if len(df) < 25: return
+            # 获取从那根阳线之后到今天的所有涨停情况
+            after_slice = hist.loc[target_idx + 1 :, 'is_zt']
+            zt_count_after = after_slice.sum()
             
-            df = df.rename(columns={'日期': 'date', '开盘': 'open', '收盘': 'close', '最高': 'high', '最低': 'low', '成交量': 'vol'})
-            df['pre_close'] = df['close'].shift(1)
-            df['is_zt'] = df.apply(lambda x: self.is_limit_up(x['close'], x['pre_close']), axis=1)
+            res_type = ""
+            # 功能1：10天内出现两根涨停，首根后回调13天
+            if zt_count_after > 0:
+                # 检查首根涨停后的10天窗口内是否有第二根
+                ten_day_window = hist.loc[target_idx + 1 : target_idx + 10, 'is_zt']
+                if ten_day_window.any():
+                    res_type = "10天双涨停-回调13天"
             
-            # 定位 13 个交易日前（Python 索引 -14）
-            target_idx = -14 
+            # 功能2：单次涨停个股隔日起回调13天
+            elif zt_count_after == 0:
+                res_type = "单次涨停-回调13天"
             
-            if df['is_zt'].iloc[target_idx]:
-                # 检查之后 13 天内的涨停数量
-                after_zt_slice = df['is_zt'].iloc[target_idx + 1:]
-                zt_count_after = after_zt_slice.sum()
-                
-                # 功能 2：单次涨停隔日起回调 13 天
-                if zt_count_after == 0:
-                    self.add_result(code, name, "单次涨停回调13天")
-                
-                # 功能 1：10天内双涨停，首根后回调 13 天
-                else:
-                    ten_day_slice = df['is_zt'].iloc[target_idx + 1 : target_idx + 11]
-                    if ten_day_slice.any():
-                        self.add_result(code, name, "10天双停回调13天")
-        except Exception:
-            pass # 抓取失败则直接跳过该股
-
-    def add_result(self, code, name, strategy_type):
-        with self.lock:
-            self.results.append({
-                "代码": code,
-                "名称": name,
-                "策略类型": strategy_type,
-                "触发日期": datetime.datetime.now().strftime('%Y-%m-%d')
-            })
-
-# ==========================================
-# 3. 缓存与数据获取逻辑
-# ==========================================
-@st.cache_data(ttl=3600)  # 缓存1小时
-def get_stock_list():
-    """安全获取并过滤股票列表"""
-    for _ in range(5): # 最多尝试5次
-        try:
-            df = ak.stock_zh_a_spot_em()
-            if df is not None:
-                filtered = df[
-                    (~df['名称'].str.contains('ST')) & 
-                    (~df['代码'].str.startswith(('30', '68')))
-                ].copy()
-                return filtered[['代码', '名称']].values.tolist()
-        except:
-            time.sleep(3)
+            if res_type:
+                return {
+                    "代码": code, 
+                    "名称": name, 
+                    "当前价格": current_price, 
+                    "换手率": turnover_rate,
+                    "判定强度": res_type, 
+                    "智能决策": "回调末端：建议关注收复信号",
+                    "所属板块": sector_info, 
+                    "查询时间": get_beijing_time()
+                }
+    except:
+        return None
     return None
 
-# ==========================================
-# 4. 网页前端界面
-# ==========================================
-def main():
-    st.set_page_config(page_title="文哥哥选股系统", layout="wide")
-    st.title("📈 13日回调选股系统 (稳定优化版)")
+# --- 3. 页面渲染 ---
 
-    # 侧边栏
-    with st.sidebar:
-        st.header("安全验证")
-        input_pwd = st.text_input("输入访问密码", type="password")
-        if not input_pwd:
-            st.info("请输入密码解锁")
-            return
-        if input_pwd != SYS_PASSWORD:
-            st.error("🔒 密码错误")
-            return
-        st.success("✅ 认证通过")
+if check_password():
+    st.title("🚀 游资核心追踪 (13日回调专项版)")
+
+    # 缓存板块列表
+    @st.cache_data(ttl=3600)
+    def get_sectors():
+        return ak.stock_board_industry_name_em()['板块名称'].tolist()
+
+    all_sectors = get_sectors()
+    selected_sector = st.sidebar.selectbox("选择查询范围", ["全市场扫描"] + all_sectors)
+    thread_count = st.sidebar.slider("并发线程数", 1, 30, 20)
+    
+    if st.button("开始穿透扫描"):
+        if 'scan_results' in st.session_state:
+            del st.session_state['scan_results']
+            
+        countdown = st.empty()
+        for i in range(3, 0, -1):
+            countdown.metric("极速引擎正在预热...", f"{i} 秒")
+            time.sleep(1)
+        countdown.empty()
+
+        with st.spinner("正在筛选活跃主板池..."):
+            # 获取股票列表并重试
+            df_pool = None
+            for _ in range(3):
+                try:
+                    df_pool = ak.stock_zh_a_spot_em() if selected_sector == "全市场扫描" else ak.stock_board_industry_cons_em(symbol=selected_sector)
+                    break
+                except: time.sleep(2)
+            
+            if df_pool is None:
+                st.error("数据连接超时，请稍后再试")
+                st.stop()
+
+            # 严格过滤逻辑：剔除ST、创业板、科创板
+            df_pool = df_pool[~df_pool['名称'].str.contains("ST|退市")]
+            df_pool = df_pool[~df_pool['代码'].str.startswith(("30", "68", "9"))]
+            # 继承母版高换手筛选
+            df_pool = df_pool[df_pool['换手率'] >= 3.0]
+
+        stocks_to_check = df_pool[['代码', '名称', '最新价', '换手率']].values.tolist()
+        total_stocks = len(stocks_to_check)
+        st.info(f"📊 待扫标的：{total_stocks} 只 (换手率≥3%)")
+        
+        progress_bar = st.progress(0.0)
+        status_text = st.empty()
+        results = []
+
+        with ThreadPoolExecutor(max_workers=thread_count) as executor:
+            future_to_stock = {executor.submit(process_single_stock, s[0], s[1], s[2], s[3], selected_sector): s for s in stocks_to_check}
+            for i, future in enumerate(as_completed(future_to_stock)):
+                res = future.result()
+                if res: 
+                    results.append(res)
+                    # 实时捕获提醒
+                    st.toast(f"✅ 捕获: {res['名称']} ({res['判定强度']})")
+                
+                if (i + 1) % 20 == 0 or (i+1) == total_stocks:
+                    progress_bar.progress(float((i + 1) / total_stocks))
+                    status_text.text(f"🚀 扫描进度: {i+1}/{total_stocks}")
+
+        status_text.success(f"✨ 扫描完成！发现符合条件标的 {len(results)} 只")
+        st.session_state['scan_results'] = results
+
+    # 结果展示
+    if 'scan_results' in st.session_state and st.session_state['scan_results']:
+        res_df = pd.DataFrame(st.session_state['scan_results'])
+        res_df.insert(0, '序号', range(1, len(res_df) + 1))
+        
+        # 序号与文字居中样式处理
         st.divider()
-        scan_btn = st.button("🚀 开始全市场扫描")
-        st.caption("提示：若提示频繁，请等待1分钟后再试。")
-
-    if scan_btn:
-        scanner = StockStrategy()
+        st.subheader("📋 13日回调选股结果")
         
-        with st.spinner("正在初始化股票列表..."):
-            stock_list = get_stock_list()
-            
-            if stock_list is None:
-                st.error("数据接口请求过于频繁，请 1 分钟后再试，或联系管理员。")
-                return
+        st.dataframe(
+            res_df.style.set_properties(**{'text-align': 'center'}), 
+            use_container_width=True, 
+            hide_index=True
+        )
 
-        # --- 多线程扫描 ---
-        progress_bar = st.progress(0)
-        status_msg = st.empty()
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            res_df.to_excel(writer, index=False, sheet_name='选股结果')
         
-        # 将并发降至 15 线程，以换取更稳定的连接成功率
-        with ThreadPoolExecutor(max_workers=15) as executor:
-            future_to_stock = {executor.submit(scanner.analyze, s[0], s[1]): s for s in stock_list}
-            completed = 0
-            total = len(stock_list)
-            
-            for future in as_completed(future_to_stock):
-                completed += 1
-                if completed % 50 == 0:
-                    progress_bar.progress(completed / total)
-                    status_msg.text(f"已扫描 {completed}/{total} 只个股 (成功数: {len(scanner.results)})")
+        st.download_button(
+            label="📥 导出当前决策清单 (Excel)",
+            data=output.getvalue(),
+            file_name=f"13日回调选股_{datetime.now().strftime('%Y%m%d')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+    elif 'scan_results' in st.session_state:
+        st.warning("完成扫描，但未发现符合条件的标的。")
 
-        # --- 结果展示 ---
-        if scanner.results:
-            df_res = pd.DataFrame(scanner.results)
-            df_res.insert(0, '序号', range(1, len(df_res) + 1))
-            
-            st.subheader(f"🎯 扫描完成：符合条件个股 ({len(df_res)} 只)")
-            
-            # 文字居中显示
-            st.dataframe(
-                df_res.style.set_properties(**{'text-align': 'center'}).set_table_styles([dict(selector='th', props=[('text-align', 'center')])]), 
-                use_container_width=True
-            )
-
-            # Excel 导出
-            excel_name = f"callback_13d_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
-            df_res.to_excel(excel_name, index=False)
-            with open(excel_name, "rb") as f:
-                st.download_button("📥 导出扫描结果 (Excel)", f, file_name=excel_name)
-        else:
-            st.info("扫描结束，未发现符合条件的个股。")
-
-if __name__ == "__main__":
-    main()
+    st.divider()
+    st.caption("Master Copy | 2026-01-20 13日回调选股版 | 自动剔除创业板/ST | 实时气泡提醒")
