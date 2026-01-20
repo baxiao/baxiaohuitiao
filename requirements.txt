@@ -2,3 +2,4 @@ streamlit
 akshare
 pandas
 openpyxl
+yfinance
