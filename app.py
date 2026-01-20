@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import yfinance as yf
 import akshare as ak
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -8,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 import random
 
 # --- 1. 配置与安全 (严格遵循母版) ---
-st.set_page_config(page_title="游资核心追踪-母版接口版", layout="wide")
+st.set_page_config(page_title="游资核心追踪-Yahoo版", layout="wide")
 
 def check_password():
     if "password_correct" not in st.session_state:
@@ -17,9 +18,6 @@ def check_password():
         pwd = st.text_input("请输入访问令牌", type="password")
         if st.button("验证登录"):
             target_pwd = st.secrets.get("STOCK_SCAN_PWD")
-            if target_pwd is None:
-                st.error("配置错误：请在 Secrets 中设置 STOCK_SCAN_PWD")
-                return False
             if pwd == target_pwd:
                 st.session_state["password_correct"] = True
                 st.rerun()
@@ -28,151 +26,148 @@ def check_password():
         return False
     return True
 
-# --- 2. 核心判定逻辑 (严格仅限13日) ---
+# --- 2. 核心判定逻辑 (Yahoo Finance 适配版) ---
 
 def get_beijing_time():
     tz = timezone(timedelta(hours=8))
     return datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
 
 def is_limit_up(close, pre_close):
-    """母版主板涨停判定"""
+    """主板涨停判定"""
     if pd.isna(pre_close) or pre_close == 0: return False
     return close >= round(pre_close * 1.10 - 0.01, 2)
 
 def process_single_stock(code, name, current_price, turnover_rate, sector_info):
     try:
-        # 抗压补丁：仅做微秒级随机避让，不改变接口逻辑
-        time.sleep(random.uniform(0.1, 0.3))
+        # Yahoo Finance 代码转换：60xxxx.SS (沪市) 或 00xxxx.SZ (深市)
+        yf_code = f"{code}.SS" if code.startswith("60") else f"{code}.SZ"
         
-        # 还原母版核心接口：ak.stock_zh_a_hist
-        hist = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq").tail(35)
-        if hist is None or len(hist) < 25: return None
+        # 获取最近 40 天数据 (yfinance 获取速度极快且稳定)
+        ticker = yf.Ticker(yf_code)
+        hist = ticker.history(period="40d")
         
-        hist = hist.reset_index(drop=True)
-        hist['pre_close'] = hist['收盘'].shift(1)
-        hist['is_zt'] = hist.apply(lambda x: is_limit_up(x['收盘'], x['pre_close']), axis=1)
+        if len(hist) < 25: return None
         
-        # 严格筛选：今天(-1)必须是首根涨停(-14)后的第13个回调交易日
+        hist = hist.reset_index()
+        hist['pre_close'] = hist['Close'].shift(1)
+        # 判定涨停
+        hist['is_zt'] = hist.apply(lambda x: is_limit_up(x['Close'], x['pre_close']), axis=1)
+        
+        # --- 严格判定：仅筛选回调第 13 天 ---
+        # 索引 -1 是今天，-14 是 13 个交易日前
         target_idx = len(hist) - 14
         if target_idx < 0: return None
         
         # 判定：13天前那根必须刚好是涨停阳线
-        if hist.loc[target_idx, 'is_zt'] and hist.loc[target_idx, '收盘'] > hist.loc[target_idx, '开盘']:
+        if hist.loc[target_idx, 'is_zt'] and hist.loc[target_idx, 'Close'] > hist.loc[target_idx, 'Open']:
             
-            # 统计回调期间是否有第二根涨停
+            # 统计回调期间的涨停数
             after_slice = hist.loc[target_idx + 1 :, 'is_zt']
             zt_count_after = after_slice.sum()
             
             res_type = ""
-            # 功能1：10天双涨停 (首根后回调13天)
             if zt_count_after > 0:
+                # 功能 1: 10 天内双涨停
                 ten_day_window = hist.loc[target_idx + 1 : target_idx + 10, 'is_zt']
                 if ten_day_window.any():
                     res_type = "10天双涨停-仅回调13天"
             
-            # 功能2：单次涨停 (隔日起回调13天)
             if not res_type and zt_count_after == 0:
+                # 功能 2: 单次涨停
                 res_type = "单次涨停-仅回调13天"
             
-            # 录入条件：符合类型且今天未再涨停
+            # 状态判定：符合类型且今天未涨停
             if res_type and not hist.iloc[-1]['is_zt']:
                 return {
-                    "代码": code, "名称": name, "当前价格": current_price, "换手率": turnover_rate,
-                    "判定强度": res_type, "智能决策": "严格13日：文字直接展示",
+                    "代码": code, "名称": name, "当前价格": f"{current_price:.2f}", 
+                    "换手率": f"{turnover_rate}%", "判定强度": res_type, 
+                    "智能决策": "Yahoo接口验证：精准13日周期",
                     "所属板块": sector_info, "查询时间": get_beijing_time()
                 }
     except: return None
     return None
 
-# --- 3. 页面渲染 (完全还原母版架构) ---
+# --- 3. 页面渲染 (母版框架) ---
 
 if check_password():
-    st.title("🚀 游资核心追踪 (13日回调-母版接口还原版)")
+    st.title("🚀 游资核心追踪 (13日回调-Yahoo Finance版)")
 
-    # 还原母版板块获取
-    with st.spinner("同步实时数据..."):
+    # 仅使用 akshare 获取板块和个股池列表（这步压力极小，通常不会封）
+    @st.cache_data(ttl=3600)
+    def get_market_data():
         try:
-            all_sectors = ak.stock_board_industry_name_em()['板块名称'].tolist()
-        except:
-            all_sectors = []
-            
+            sectors = ak.stock_board_industry_name_em()['板块名称'].tolist()
+            return sectors
+        except: return []
+
+    all_sectors = get_market_data()
     selected_sector = st.sidebar.selectbox("选择查询范围", ["全市场扫描"] + all_sectors)
-    thread_count = st.sidebar.slider("并发线程数", 1, 30, 20)
+    thread_count = st.sidebar.slider("并发线程数 (Yahoo版建议20+)", 1, 50, 30)
     
     if st.button("开始穿透扫描"):
         if 'scan_results' in st.session_state:
             del st.session_state['scan_results']
             
-        # 母版标志性倒计时
+        # 倒计时模块
         countdown = st.empty()
         for i in range(3, 0, -1):
-            countdown.metric("极速引擎正在预热...", f"{i} 秒")
+            countdown.metric("Yahoo Finance 全球数据引擎预热...", f"{i} 秒")
             time.sleep(1)
         countdown.empty()
 
-        with st.spinner("正在筛选池标的..."):
-            # 还原母版股票池获取接口
-            df_pool = None
+        with st.spinner("正在初始化股票池..."):
             try:
                 if selected_sector == "全市场扫描":
                     df_pool = ak.stock_zh_a_spot_em()
                 else:
                     df_pool = ak.stock_board_industry_cons_em(symbol=selected_sector)
+                
+                # 严格过滤 (母版核心)
+                df_pool = df_pool[~df_pool['名称'].str.contains("ST|退市")]
+                df_pool = df_pool[~df_pool['代码'].str.startswith(("30", "68", "9"))]
+                df_pool = df_pool[df_pool['换手率'] >= 3.0]
             except:
-                st.error("母版接口连接繁忙，请稍后再试")
+                st.error("初始化失败，请重试")
                 st.stop()
-
-            # 严格过滤：剔除ST、创业板、科创板 (母版核心)
-            df_pool = df_pool[~df_pool['名称'].str.contains("ST|退市")]
-            df_pool = df_pool[~df_pool['代码'].str.startswith(("30", "68", "9"))]
-            df_pool = df_pool[df_pool['换手率'] >= 3.0]
 
         stocks_to_check = df_pool[['代码', '名称', '最新价', '换手率']].values.tolist()
         total_stocks = len(stocks_to_check)
-        st.info(f"📊 待扫标的：{total_stocks} 只 (换手率≥3%)")
+        st.info(f"📊 待扫：{total_stocks} 只 (使用 Yahoo Finance 接口)")
         
         progress_bar = st.progress(0.0)
         status_text = st.empty()
         results = []
 
-        # 多线程扫描
+        # 多线程高压扫描 (Yahoo 接口抗压能力极强)
         with ThreadPoolExecutor(max_workers=thread_count) as executor:
             future_to_stock = {executor.submit(process_single_stock, s[0], s[1], s[2], s[3], selected_sector): s for s in stocks_to_check}
             for i, future in enumerate(as_completed(future_to_stock)):
                 res = future.result()
                 if res: 
                     results.append(res)
-                    st.toast(f"✅ 捕获: {res['名称']}")
+                    st.toast(f"✅ Yahoo捕获: {res['名称']}")
                 
                 if (i + 1) % 10 == 0 or (i+1) == total_stocks:
                     progress_bar.progress(float((i + 1) / total_stocks))
                     status_text.text(f"🚀 扫描进度: {i+1}/{total_stocks}")
 
-        status_text.success(f"✨ 扫描完成！仅录入13日回调股：{len(results)} 只")
+        status_text.success(f"✨ 扫描完成！共发现 {len(results)} 只标的")
         st.session_state['scan_results'] = results
 
-    # 结果展示 (序号居中，文字直接显示)
+    # 结果展示 (序号居中)
     if 'scan_results' in st.session_state and st.session_state['scan_results']:
         res_df = pd.DataFrame(st.session_state['scan_results'])
         res_df.insert(0, '序号', range(1, len(res_df) + 1))
-        
         st.divider()
-        st.subheader("📋 扫描分析结果")
         st.dataframe(
             res_df.style.set_properties(**{'text-align': 'center'}), 
             use_container_width=True, 
             hide_index=True
         )
 
-        # Excel 导出
         output = io.BytesIO()
         res_df.to_excel(output, index=False)
-        st.download_button(
-            label="📥 导出结果 (Excel)",
-            data=output.getvalue(),
-            file_name=f"13日还原选股_{datetime.now().strftime('%m%d')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+        st.download_button(label="📥 导出 Excel", data=output.getvalue(), file_name=f"Yahoo选股_{datetime.now().strftime('%m%d')}.xlsx")
 
     st.divider()
-    st.caption("Master Copy | 序号居中稳定母版框架 | 原始接口已还原")
+    st.caption("Master Copy | 序号居中稳定版 | Yahoo Finance 接口驱动")
