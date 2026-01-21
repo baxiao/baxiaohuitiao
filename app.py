@@ -5,37 +5,31 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import io
 from datetime import datetime, timedelta
-import gc # 导入垃圾回收
+import gc
 
 # --- 1. 配置 ---
-st.set_page_config(page_title="游资核心追踪-抗压版", layout="wide")
+st.set_page_config(page_title="游资核心追踪-加固版", layout="wide")
 
-def get_all_mainboard_stocks():
-    """环节一：获取全市场主板股票"""
-    bs.login() # 确保在获取名单前登录
-    rs = bs.query_all_stock(day=datetime.now().strftime('%Y-%m-%d'))
-    data_list = []
-    while (rs.error_code == '0') & rs.next():
-        data_list.append(rs.get_row_data())
-    bs.logout()
-    
-    if not data_list: return []
-    raw_df = pd.DataFrame(data_list, columns=rs.fields)
-    main_df = raw_df[(~raw_df['code_name'].str.contains("ST")) & 
-                     (raw_df['code'].str.startswith(('sh.60', 'sz.00')))]
-    return main_df[['code', 'code_name']].values.tolist()
+# --- 2. 核心分析逻辑 ---
 
-def fetch_stock_analysis(bs_code, name):
-    """环节二核心：带强力异常处理和内存释放"""
+def fetch_stock_analysis_safe(bs_code, name):
+    """
+    单只股票处理逻辑
+    注意：此函数内部不再调用 bs.login()，由主程序统一维护连接
+    """
     try:
-        # 每次请求尝试重新开启一小段连接，避免长时间占用
-        rs = bs.query_history_k_data_plus(bs_code,
+        # 获取历史数据
+        rs = bs.query_history_k_data_plus(
+            bs_code,
             "date,open,high,low,close,volume,turnover",
             start_date=(datetime.now() - timedelta(days=35)).strftime('%Y-%m-%d'),
             end_date=datetime.now().strftime('%Y-%m-%d'),
-            frequency="d", adjustflag="3")
+            frequency="d", adjustflag="3"
+        )
         
-        if rs.error_code != '0': return None
+        # 核心报错处理：如果返回错误码，说明连接可能已经断开
+        if rs is None or rs.error_code != '0':
+            return None
 
         data_list = []
         while rs.next():
@@ -48,68 +42,106 @@ def fetch_stock_analysis(bs_code, name):
         
         latest_turnover = df.iloc[-1]['turnover']
         
+        # 环节二：换手率过滤
         if latest_turnover >= 3.0:
-            res = {"code": bs_code, "name": name, "df": df, "turnover": latest_turnover}
-            return res
-        
-        # 💡 主动清理不再需要的变量，释放内存
-        del df
-        del data_list
-    except:
+            # 环节三：连阳判定
+            df['is_pos'] = df['close'] > df['open']
+            pos_list = df['is_pos'].tolist()
+            
+            # 剔除 8 连阳及以上
+            if len(pos_list) >= 8 and all(pos_list[-8:]): return None
+
+            for d, g_limit in [(7, 22.5), (6, 17.5), (5, 12.5)]:
+                sub = df.tail(d)
+                if (sub['close'] > sub['open']).all():
+                    gain = round(((sub.iloc[-1]['close'] - sub.iloc[0]['open']) / sub.iloc[0]['open']) * 100, 2)
+                    if gain <= g_limit:
+                        return {
+                            "代码": bs_code.split('.')[1], 
+                            "名称": name, 
+                            "换手率": f"{latest_turnover}%", 
+                            "判定强度": f"{d}连阳", 
+                            "区间涨幅": f"{gain}%", 
+                            "最新价": round(df.iloc[-1]['close'], 2)
+                        }
         return None
-    return None
+    except Exception:
+        return None
 
 # --- 3. 页面渲染 ---
-st.title("🚀 游资核心追踪 (Baostock 全量抗压版)")
+
+st.title("🚀 游资核心追踪 (架构加固版)")
 
 with st.sidebar:
-    st.header("性能调优")
-    # 💡 建议降低并发，避免触发 Baostock 封锁
-    thread_num = st.slider("并发强度", 1, 10, 5) 
-    st.warning("如遇到 3000+ 数量卡顿，请调低并发至 3-5。")
+    st.header("控制台")
+    # 💡 强制将并发建议调低到 3-5，Baostock 的稳定性第一
+    thread_num = st.slider("并发强度", 1, 8, 4)
+    st.info("提示：此版本增强了连接保护，如遇中断将自动跳过。")
 
 if st.button("启动全量穿透扫描"):
-    bs.login()
-    
-    with st.spinner("📦 环节一：正在拉取名册..."):
-        initial_list = get_all_mainboard_stocks()
-    
-    if initial_list:
-        st.write(f"### 📍 环节二：活跃股筛选 (待扫: {len(initial_list)})")
-        passed_turnover = []
-        progress_bar = st.progress(0.0)
-        status_text = st.empty()
+    # 统一登录
+    login_res = bs.login()
+    if login_res.error_code != '0':
+        st.error(f"登录失败: {login_res.error_msg}")
+    else:
+        # 环节一：获取名册
+        with st.spinner("📦 正在拉取全量名册..."):
+            rs_all = bs.query_all_stock(day=datetime.now().strftime('%Y-%m-%d'))
+            stock_list = []
+            while rs_all.next():
+                row = rs_all.get_row_data()
+                # 过滤主板和非 ST
+                if (row[0].startswith(('sh.60', 'sz.00'))) and ("ST" not in row[1]):
+                    stock_list.append([row[0], row[1]])
         
-        # 💡 增加分批处理逻辑，每扫描 500 只强制休息 2 秒，防止内存和连接溢出
-        batch_size = 500
-        for batch_idx in range(0, len(initial_list), batch_size):
-            batch = initial_list[batch_idx : batch_idx + batch_size]
+        if stock_list:
+            st.write(f"### 📍 环节二 & 三：全市场联合分析 (总量: {len(stock_list)})")
+            final_results = []
+            progress_bar = st.progress(0.0)
+            status_text = st.empty()
             
-            with ThreadPoolExecutor(max_workers=thread_num) as executor:
-                futures = {executor.submit(fetch_stock_analysis, s[0], s[1]): s for s in batch}
-                for i, future in enumerate(as_completed(futures)):
-                    try:
-                        # 💡 增加严格的 2 秒超时
-                        res = future.result(timeout=2)
-                        if res: passed_turnover.append(res)
-                    except: continue
-                    
-                    # 进度条更新
-                    total_idx = batch_idx + i + 1
-                    pct = total_idx / len(initial_list)
-                    progress_bar.progress(pct)
-                    status_text.text(f"已扫描: {total_idx} / {len(initial_list)}")
-            
-            # 💡 关键：每批次结束，强制执行垃圾回收，清理内存
-            gc.collect()
-            time.sleep(1) # 给服务器喘息时间
+            # 💡 采用分批处理模式，每 100 个强制检查一次连接
+            batch_size = 100
+            for i in range(0, len(stock_list), batch_size):
+                batch = stock_list[i : i + batch_size]
+                
+                with ThreadPoolExecutor(max_workers=thread_num) as executor:
+                    futures = {executor.submit(fetch_stock_analysis_safe, s[0], s[1]): s for s in batch}
+                    for j, future in enumerate(as_completed(futures)):
+                        try:
+                            # 增加更短的超时，避免 Bad File Descriptor 扩散
+                            res = future.result(timeout=5)
+                            if res:
+                                final_results.append(res)
+                                st.toast(f"✅ 捕获: {res['名称']}")
+                        except:
+                            continue
+                        
+                        # 更新进度
+                        total_done = i + j + 1
+                        progress_bar.progress(total_done / len(stock_list))
+                        if total_done % 20 == 0:
+                            status_text.text(f"已处理: {total_done} / {len(stock_list)}")
+                
+                # 每组结束释放内存
+                gc.collect()
 
-        # 环节三逻辑
-        if passed_turnover:
+            # 结果展示
             st.divider()
-            st.write("### 🔥 环节三：连阳战法精选")
-            # ... 此处省略连阳验证逻辑，同母版 ...
-            # 请参考前一版代码中的 check_positive_days 部分
-            # ...
+            if final_results:
+                res_df = pd.DataFrame(final_results)
+                res_df.insert(0, '序号', range(1, len(res_df) + 1))
+                st.subheader("🏆 最终精选战报")
+                st.dataframe(res_df, use_container_width=True, hide_index=True)
+                
+                output = io.BytesIO()
+                res_df.to_excel(output, index=False)
+                st.download_button("📥 导出全场扫描报告", output.getvalue(), "全量分析报告.xlsx")
+            else:
+                st.warning("完成扫描，未发现符合条件的标的。")
         
-    bs.logout()
+        # 统一登出
+        bs.logout()
+
+st.divider()
+st.caption("2026-01-21 | Baostock 驱动 | 异常熔断机制 | 稳定性优先版")
