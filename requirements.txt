@@ -1,7 +1,6 @@
 streamlit>=1.32.0
 akshare>=1.11.0
-pandas>=2.2.0
-numpy>=1.26.0
+pandas>=2.0.0
+numpy>=1.21.0
 bcrypt>=4.0.1
-openpyxl>=3.1.0
-concurrent-futures>=3.1.1
+openpyxl>=3.0.0
