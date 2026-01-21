@@ -18,9 +18,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# 强制指定东方财富数据源，提高稳定性
-ak.set_option("akshare.data_source", "eastmoney")
-
 # 全局变量
 lock = threading.Lock()
 results_cache = {}
@@ -80,10 +77,17 @@ def get_stock_sector(stock_code: str) -> str:
         # 设置请求超时，避免卡死
         session = requests.Session()
         session.timeout = 5
+        
+        # 手动设置AKShare的session
+        old_session = ak.session
         ak.session = session
         
         sector_df = ak.stock_sector_spot_em(symbol=stock_code)
-        return sector_df.iloc[0]['行业板块'] if not sector_df.empty else "未知"
+        result = sector_df.iloc[0]['行业板块'] if not sector_df.empty else "未知"
+        
+        # 恢复原有session
+        ak.session = old_session
+        return result
     except:
         return "未知"
 
@@ -93,6 +97,9 @@ def get_stock_data(stock_code: str, start_date: str, end_date: str) -> pd.DataFr
         # 设置请求超时
         session = requests.Session()
         session.timeout = 10
+        
+        # 手动设置AKShare的session
+        old_session = ak.session
         ak.session = session
         
         # 获取前复权数据
@@ -103,6 +110,9 @@ def get_stock_data(stock_code: str, start_date: str, end_date: str) -> pd.DataFr
             end_date=end_date,
             adjust="qfq"
         )
+        
+        # 恢复原有session
+        ak.session = old_session
         return stock_df if not stock_df.empty else pd.DataFrame()
     except Exception as e:
         st.warning(f"[{stock_code}] 数据获取失败: {str(e)}")
