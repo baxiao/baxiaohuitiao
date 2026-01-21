@@ -7,8 +7,8 @@ import random
 from datetime import datetime, timedelta
 
 # --- 页面配置 ---
-st.set_page_config(page_title="A股全市场涨停回调筛选(终极稳定版)", layout="wide")
-st.title("🔍 A股全市场涨停回调筛选工具 (底层接口版)")
+st.set_page_config(page_title="A股全市场涨停回调筛选(终极版)", layout="wide")
+st.title("🔍 A股全市场涨停回调筛选工具 v5 (统一接口版)")
 
 # --- 侧边栏设置 ---
 st.sidebar.header="⚙️ 筛选参数设置"
@@ -37,66 +37,49 @@ def safe_request(func, max_retries=3, *args, **kwargs):
                 wait_time = (attempt + 1) * 2
                 time.sleep(wait_time)
             else:
+                # 最后一次失败，打印详细错误
+                st.error(f"API请求彻底失败: {str(e)}")
                 return None
     return None
 
-# --- 获取股票列表 (使用更稳定的 Spot 接口) ---
+# --- 获取股票列表 (使用最稳健的 stock_zh_a_spot_em) ---
 def get_stock_list():
     try:
-        st.info("正在通过实时行情接口获取全市场股票列表...")
+        st.info("正在获取全市场 A 股列表 (统一接口)...")
         
-        # 使用 stock_sh_a_spot_em 和 stock_sz_a_spot_em
-        # 这些接口通常返回字段：代码, 名称, 最新价, 涨跌幅...
-        # 我们只需要 代码 和 名称
+        # 这是一个非常稳定的接口，一次获取所有沪深A股
+        # 列名通常包含：代码, 名称, 最新价, 涨跌幅...
+        df = safe_request(ak.stock_zh_a_spot_em)
         
-        sh_df = safe_request(ak.stock_sh_a_spot_em)
-        if sh_df is None or sh_df.empty:
-            st.error("获取沪市列表失败。")
-            return pd.DataFrame()
-            
-        sz_df = safe_request(ak.stock_sz_a_spot_em)
-        if sz_df is None or sz_df.empty:
-            st.error("获取深市列表失败。")
+        if df is None or df.empty:
+            st.error("无法获取股票列表，可能是网络问题或 AkShare 版本过旧。请运行 `pip install --upgrade akshare`。")
             return pd.DataFrame()
         
-        # 标准化列名 (这两个接口通常返回 '代码' 和 '名称')
-        # 为了保险，再做一次清洗
-        def clean_df(df):
-            df['代码'] = df['代码'].astype(str).str.zfill(6)
-            # 确保只保留这两列
-            return df[['代码', '名称']]
-            
-        sh_clean = clean_df(sh_df)
-        sz_clean = clean_df(sz_df)
+        # 检查是否有 '代码' 和 '名称' 列
+        if '代码' not in df.columns or '名称' not in df.columns:
+            st.error(f"接口返回格式异常，未找到 '代码' 或 '名称' 列。当前列名: {df.columns.tolist()}")
+            return pd.DataFrame()
         
-        # 合并
-        all_stocks = pd.concat([sh_clean, sz_clean], ignore_index=True)
+        # 数据清洗
+        df['代码'] = df['代码'].astype(str).str.zfill(6)
+        df['名称'] = df['名称'].astype(str)
         
-        # 统一重命名为 code 和 name
-        all_stocks.rename(columns={'代码': 'code', '名称': 'name'}, inplace=True)
+        # 只保留需要的两列
+        stocks = df[['代码', '名称']].copy()
+        stocks.rename(columns={'代码': 'code', '名称': 'name'}, inplace=True)
         
         # 剔除 ST, *ST, 退, 停
-        # 先把 name 转成字符串防止报错
-        all_stocks['name'] = all_stocks['name'].astype(str)
-        # 使用正则过滤
         pattern = re.compile(r'^(\*?ST|ST|退|PT|暂停)')
-        filtered = all_stocks[~all_stocks['name'].str.match(pattern)]
+        filtered = stocks[~stocks['name'].str.match(pattern)]
         
-        # 剔除 B 股 (通常 SH B股是 900开头，SZ B股是 200开头，或者包含B)
-        # 这里简单通过代码前缀剔除
-        filtered = filtered[~filtered['code'].str.startswith('900')]
-        filtered = filtered[~filtered['code'].str.startswith('200')]
+        # 剔除 B 股 (代码通常包含 B 或者特定前缀，但这个接口通常只返回A股，为了保险起见)
+        # stock_zh_a_spot_em 本身就是 A 股，所以这里可以放宽，或者按需过滤
         
         st.success(f"获取成功，共筛选出 {len(filtered)} 只有效股票。")
         return filtered
         
     except Exception as e:
-        st.error(f"获取列表出错: {e}")
-        # 如果是列名错误，打印列名方便调试
-        try:
-            if 'sh_df' in locals(): st.write("沪市列名:", sh_df.columns.tolist())
-        except:
-            pass
+        st.error(f"获取列表发生未知错误: {e}")
         return pd.DataFrame()
 
 # --- 策略分析函数 ---
@@ -243,10 +226,8 @@ if 'scan_results' in st.session_state and st.session_state['scan_results']:
             st.markdown("### 🔵 普通单涨停观察")
             st.dataframe(single_mode.sort_values(by='days_into_pullback', ascending=True), use_container_width=True)
             
-        csv = result_df.to_csv(index_index=False).encode('utf-8') # 注意这里有个小修复
-        # 上一行代码有个typo: index_index -> index. 下面已修复
-        csv_correct = result_df.to_csv(index=False).encode('utf-8')
-        st.download_button("下载CSV结果", csv_correct, "stock_signals.csv", "text/csv")
+        csv = result_df.to_csv(index=False).encode('utf-8')
+        st.download_button("下载CSV结果", csv, "stock_signals.csv", "text/csv")
 
     with tab2:
         st.subheader("查看个股详情")
