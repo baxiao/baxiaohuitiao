@@ -6,7 +6,6 @@ import datetime
 import time
 import threading
 import concurrent.futures
-import bcrypt
 import io
 from typing import List, Dict, Tuple, Optional
 
@@ -18,45 +17,33 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# 密码认证配置
-USER_CREDENTIALS = {
-    "admin": b'$2b$12$EixZaYb4xU58Gpq1R0yWbeb00LU5qUaK6x6h6X6h6X6h6X6h6X6h6'  # 密码: admin123
-}
-
 # 全局变量
 lock = threading.Lock()
 results_cache = {}
 filtering_status = {"running": False, "progress": 0, "message": "等待开始"}
 
-def hash_password(password: str) -> bytes:
-    """密码哈希"""
-    salt = bcrypt.gensalt()
-    return bcrypt.hashpw(password.encode('utf-8'), salt)
-
-def verify_password(input_password: str, hashed_password: bytes) -> bool:
-    """验证密码"""
-    return bcrypt.checkpw(input_password.encode('utf-8'), hashed_password)
-
 def authenticate_user() -> bool:
-    """用户认证"""
+    """用户认证 - 仅密码验证"""
     if 'authenticated' in st.session_state and st.session_state.authenticated:
         return True
     
     st.title("🔒 股票涨停回调筛选系统 - 登录")
     
+    # 从Secrets获取密码，如果不存在则使用默认密码
+    expected_password = st.secrets.get("app_password", "stock123456")
+    
     with st.form("login_form"):
-        username = st.text_input("用户名")
-        password = st.text_input("密码", type="password")
+        password = st.text_input("请输入访问密码", type="password")
         submit_button = st.form_submit_button("登录")
         
         if submit_button:
-            if username in USER_CREDENTIALS and verify_password(password, USER_CREDENTIALS[username]):
+            if password == expected_password:
                 st.session_state.authenticated = True
                 st.success("登录成功！")
                 time.sleep(1)
                 st.rerun()
             else:
-                st.error("用户名或密码错误")
+                st.error("密码错误，请重试")
     
     return False
 
@@ -225,8 +212,8 @@ def filter_stocks_multithread(stock_list: pd.DataFrame, start_date: str, end_dat
     all_results = []
     total_stocks = len(stock_list)
     
-    # 使用线程池
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+    # 使用线程池 - 减少线程数量以适应云环境
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         # 提交所有任务
         futures = []
         for _, row in stock_list.iterrows():
