@@ -5,10 +5,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import io
 from datetime import datetime
 import requests
-import json
 
 # --- 1. 配置与安全 ---
-st.set_page_config(page_title="游资核心追踪-纯腾讯引擎", layout="wide")
+st.set_page_config(page_title="游资核心追踪-终极稳定版", layout="wide")
 
 def check_password():
     if "password_correct" not in st.session_state:
@@ -26,38 +25,27 @@ def check_password():
         return False
     return True
 
-# --- 2. 腾讯原生 API 数据引擎 (核心修复) ---
+# --- 2. 网易财经名单引擎 (解决 Expecting Value 报错) ---
 
-@st.cache_data(ttl=600)
-def get_tencent_full_pool():
-    """获取腾讯全量 A 股名单 (修复0只问题)"""
-    # 腾讯的核心行情列表接口
-    url = "https://gu.qq.com/proxy/squote/list?m=all&t=sh_a,sz_a&p=1&l=6000&v=2"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-        "Referer": "https://gu.qq.com/"
-    }
+@st.cache_data(ttl=3600)
+def get_wy_full_pool():
+    """从网易财经获取全量 A 股名单 (CSV 接口，极稳)"""
+    # 0代表沪市，1代表深市。我们合并获取。
+    url = "http://quotes.money.163.com/hs/service/diyrank.php?host=http%3A%2F%2Fquotes.money.163.com%2Fhs%2Fservice%2Fdiyrank.php&page=0&query=STYPE%3AEQA&fields=SYMBOL%2CNAME%2CPRICE&sort=SYMBOL&order=asc&count=6000&type=query"
     try:
-        r = requests.get(url, headers=headers, timeout=10)
+        r = requests.get(url, timeout=10)
         data = r.json()
-        # 腾讯接口数据在 data['data']['list'] 中
-        raw_list = data['data']['list']
-        stocks = []
-        for item in raw_list:
-            stocks.append({
-                "代码": item['code'],
-                "名称": item['name'],
-                "最新价": item['last']
-            })
-        df = pd.DataFrame(stocks)
+        raw_list = data['list']
+        df = pd.DataFrame(raw_list)
+        df = df[['SYMBOL', 'NAME', 'PRICE']]
+        df.columns = ['代码', '名称', '最新价']
         return df
     except Exception as e:
         st.error(f"名单拉取异常: {e}")
         return pd.DataFrame()
 
 def fetch_kline_tencent(code):
-    """腾讯 K 线穿透接口"""
-    # 自动识别沪深前缀
+    """腾讯 K 线穿透接口 (依然使用腾讯，判定速度快)"""
     symbol = f"sh{code}" if code.startswith("60") else f"sz{code}"
     url = f"http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={symbol},day,,,45,qfq&_={int(time.time())}"
     try:
@@ -83,7 +71,7 @@ def scan_logic(code, name, price):
         df['pre_close'] = df['close'].shift(1)
         df['is_zt'] = df.apply(lambda x: is_limit_up(x['close'], x['pre_close']), axis=1)
         
-        # 严格 13 日判定逻辑 (T-13位是涨停)
+        # 严格 13 日判定逻辑 (倒数第14天为涨停)
         target_idx = len(df) - 14
         if target_idx < 0: return None
         
@@ -96,14 +84,11 @@ def scan_logic(code, name, price):
             elif after_zt == 0:
                 res_type = "单次涨停-仅回调13天"
             
-            # 今日未涨停 (回调状态)
+            # 今日处于回调中 (非涨停)
             if res_type and not df.iloc[-1]['is_zt']:
                 return {
-                    "代码": code, 
-                    "名称": name, 
-                    "当前价格": price,
-                    "强度等级": res_type, 
-                    "智能决策": "严格13日：腾讯引擎验证成功",
+                    "代码": code, "名称": name, "当前价格": price,
+                    "强度等级": res_type, "智能决策": "严格13日：穿透验证成功",
                     "扫描时间": datetime.now().strftime("%H:%M:%S")
                 }
     except: return None
@@ -112,19 +97,19 @@ def scan_logic(code, name, price):
 # --- 3. UI 渲染 ---
 
 if check_password():
-    st.title("🚀 游资核心追踪 (腾讯原生-核心版)")
+    st.title("🚀 游资核心追踪 (终极稳定版)")
     
     thread_count = st.sidebar.slider("并发扫描强度", 1, 60, 40)
     
-    if st.button("开启全量穿透扫描"):
+    if st.button("开启全量 13 日周期扫描"):
         if 'scan_results' in st.session_state:
             del st.session_state['scan_results']
             
-        with st.spinner("📦 正在拉取腾讯全量主板名单..."):
-            df_pool = get_tencent_full_pool()
+        with st.spinner("📦 正在拉取网易全量主板名单..."):
+            df_pool = get_wy_full_pool()
             
             if df_pool.empty:
-                st.error("❌ 无法获取名单，请检查网络或刷新页面。")
+                st.error("❌ 名单接口被限制，请稍后再试或联系开发者。")
                 st.stop()
             
             # 严格过滤：剔除 ST、创业板(30)、科创板(68)、北交所(8/9)
@@ -132,7 +117,7 @@ if check_password():
             df_pool = df_pool[~df_pool['代码'].str.startswith(("30", "68", "8", "9"))]
 
         stocks = df_pool.values.tolist()
-        st.info(f"📊 名单构建成功：共 {len(stocks)} 只主板标的 | 无换手率限制")
+        st.info(f"📊 名单构建成功：共 {len(stocks)} 只主板标的 | 全量扫描模式")
         
         progress_bar = st.progress(0.0)
         status_text = st.empty()
@@ -166,7 +151,7 @@ if check_password():
 
         output = io.BytesIO()
         res_df.to_excel(output, index=False)
-        st.download_button("📥 导出扫描结果", data=output.getvalue(), file_name=f"腾讯选股_{datetime.now().strftime('%m%d')}.xlsx")
+        st.download_button("📥 导出扫描结果", data=output.getvalue(), file_name=f"13日扫描_{datetime.now().strftime('%m%d')}.xlsx")
 
     st.divider()
-    st.caption("Master Copy | 纯腾讯原生接口 | 取消换手率限制 | 修复0标的问题")
+    st.caption("Master Copy | 网易名单+腾讯K线 | 无 Akshare | 无换手率限制")
