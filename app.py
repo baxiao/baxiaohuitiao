@@ -1,174 +1,242 @@
 import streamlit as st
 import akshare as ak
 import pandas as pd
-import mplfinance as mpf
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
+import time
+import re
 from datetime import datetime, timedelta
 
-# --- 配置页面 ---
-st.set_page_config(page_title="A股涨停回调分析工具", layout="wide")
-st.title("🚀 A股涨停回调分析工具 (基于Streamlit)")
-st.markdown("""
-**功能说明：**
-1. **模式1**：筛选10天内出现两根涨停阳线，标记从首根阳线次日开始的13天观察期。
-2. **模式2**：标记单次涨停个股隔日起的13天观察期。
-""")
+# --- 页面配置 ---
+st.set_page_config(page_title="A股全市场涨停回调筛选", layout="wide")
+st.title("🔍 A股全市场涨停回调筛选工具 (剔除ST/退市)")
 
 # --- 侧边栏设置 ---
-st.sidebar.header("参数设置")
-stock_code = st.sidebar.text_input("股票代码", value="600519", max_chars=6, help="例如：600519 (贵州茅台)")
-start_date = st.sidebar.date_input("开始日期", datetime.now() - timedelta(days=180))
-end_date = st.sidebar.date_input("结束日期", datetime.now())
+st.sidebar.header="⚙️ 筛选参数设置"
+days_to_fetch = st.sidebar.slider("获取历史天数", min_value=30, max_value=180, value=60, help="获取多少天的数据进行分析")
+limit_threshold = st.sidebar.slider("涨停阈值 (%)", min_value=9.0, max_value=20.0, value=9.9, step=0.1)
 
-# --- 数据获取函数 ---
-@st.cache_data
-def get_stock_data(code, start, end):
+st.sidebar.info("注意：全市场筛选需要请求数千次API，首次运行较慢，请耐心等待。")
+
+# --- 核心逻辑函数 ---
+
+def get_stock_list():
+    """获取A股所有股票代码，并剔除ST和退市股"""
     try:
-        # 获取A股前复权数据
-        df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start, end_date=end, adjust="qfq")
-        if df.empty:
-            return None
+        st.info("正在获取全市场股票列表...")
+        stock_list = ak.stock_info_a_code_name()
         
-        # 数据清洗
-        df['日期'] = pd.to_datetime(df['日期'])
-        df.set_index('日期', inplace=True)
-        # 重命名列以适配 mplfinance
-        df.rename(columns={
-            '开盘': 'Open', '最高': 'High', '最低': 'Low', 
-            '收盘': 'Close', '成交量': 'Volume'
-        }, inplace=True)
+        # 预处理：转为字符串并过滤
+        stock_list['code'] = stock_list['code'].astype(str).str.zfill(6)
         
-        # 计算涨跌幅 (用于辅助判断)
-        df['pct_change'] = df['Close'].pct_change()
-        return df
+        # 过滤逻辑
+        # 1. 剔除 ST, *ST, 退
+        # 2. 只保留 6 (沪主板), 0 (深主板), 3 (创业板) - 可根据需要调整，这里包含创业板
+        valid_pattern = re.compile(r'^(600|601|603|605|688|000|001|002|003|300)')
+        
+        filtered_list = stock_list[
+            (~stock_list['name'].str.contains('ST|退|停')) & 
+            (stock_list['code'].str.match(valid_pattern))
+        ]
+        
+        st.success(f"获取成功，共筛选出 {len(filtered_list)} 只有效股票。")
+        return filtered_list
     except Exception as e:
-        st.error(f"获取数据失败: {e}")
-        return None
+        st.error(f"获取股票列表失败: {e}")
+        return pd.DataFrame()
 
-# --- 策略核心逻辑 ---
-def analyze_signals(df):
-    if df is None or df.empty:
-        return None
-
-    # 定义涨停 (这里简化为涨幅 >= 9.9%，实际ST股是5%，科创板20%，可根据需要细化)
-    # 为了演示，我们使用通用的大于9.8%
-    is_limit_up = df['pct_change'] >= 0.098
-    limit_up_days = df[is_limit_up].index
-
-    signals = []
-    
-    # 策略1: 10天内出现两根涨停阳线，以首根阳线第二天开始回调13天
-    # 逻辑：找到所有满足条件的时间段
-    # 这里我们简化逻辑：如果在10天窗口内有2个以上涨停，则标记第一个涨停后的13天
-    
-    window_days = 10
-    callback_days = 13
-    
-    # 遍历数据，寻找符合条件的窗口
-    for i in range(len(df) - window_days):
-        window_df = df.iloc[i : i + window_days]
-        window_limit_ups = window_df[window_df['pct_change'] >= 0.098]
+@st.cache_data
+def analyze_single_stock(code, name, end_date_str, history_days, threshold):
+    """分析单只股票是否符合条件"""
+    try:
+        # 计算开始日期
+        end_date = datetime.strptime(end_date_str, "%Y%m%d")
+        start_date = end_date - timedelta(days=history_days + 20) # 多取一点确保有数据
         
-        if len(window_limit_ups) >= 2:
-            # 找到了符合条件的窗口
-            first_up_date = window_limit_ups.index[0]
-            second_up_date = window_limit_ups.index[1]
+        start_str = start_date.strftime("%Y%m%d")
+        
+        # 获取数据 (前复权)
+        df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_str, end_date=end_date_str, adjust="qfq")
+        
+        if df.empty or len(df) < 20:
+            return None
             
-            # 标记区域：首根次日 -> +13天
-            start_mark = first_up_date + timedelta(days=1)
-            end_mark = first_up_date + timedelta(days=callback_days)
+        df['日期'] = pd.to_datetime(df['日期'])
+        df = df.set_index('日期').sort_index()
+        df['pct_change'] = df['收盘'].pct_change()
+        
+        # 定义涨停
+        is_limit_up = df['pct_change'] >= (threshold / 100.0)
+        
+        # 获取最近的日期
+        latest_date = df.index[-1]
+        results = []
+        
+        # --- 策略2: 单次涨停隔日起回调13天 ---
+        # 找出所有涨停日
+        limit_dates = df[is_limit_up].index
+        
+        for date in limit_dates:
+            # 观察区间：涨停次日 到 涨停日+13天
+            # 只有当“今天”还在观察区间内时，才提示用户
+            obs_start = date + timedelta(days=1)
+            obs_end = date + timedelta(days=13)
             
-            # 避免重复标记（简单去重）
-            if not any(s['date'] == first_up_date for s in signals):
-                signals.append({
-                    'type': '双涨停模式',
-                    'date': first_up_date,
-                    'start_highlight': start_mark,
-                    'end_highlight': end_mark,
-                    'desc': f"10日双连阳，回调观察期：{start_mark.date()} 至 {end_mark.date()}"
+            if obs_start <= latest_date <= obs_end:
+                results.append({
+                    'code': code,
+                    'name': name,
+                    'type': '单次涨停观察中',
+                    'trigger_date': date.date(),
+                    'days_into_pullback': (latest_date - date).days,
+                    'current_price': df.loc[latest_date, '收盘'],
+                    'obs_end_date': obs_end.date()
                 })
 
-    # 策略2: 单次涨停个股隔日起回调13天 (为了不覆盖策略1，我们优先显示策略1，或者只显示非重叠的)
-    # 这里逻辑：只要是涨停，就标记后13天
-    for date in limit_up_days:
-        start_mark = date + timedelta(days=1)
-        end_mark = date + timedelta(days=callback_days)
-        
-        # 检查这个时间是否已经被策略1覆盖，避免太乱，可选逻辑
-        signals.append({
-            'type': '单次涨停',
-            'date': date,
-            'start_highlight': start_mark,
-            'end_highlight': end_mark,
-            'desc': f"单日涨停，观察期：{start_mark.date()} 至 {end_mark.date()}"
-        })
-
-    return pd.DataFrame(signals)
-
-# --- 绘图函数 ---
-def plot_chart(df, signals_df, code):
-    if df.empty:
-        return
-
-    # 准备绘图数据
-    mc = mpf.make_marketcolors(up='r', down='g', edge='i', wick='i', volume='in', inherit=True)
-    s = mpf.make_mpf_style(marketcolors=mc, gridstyle='--', y_on_right=False)
-
-    # 创建叠加图层
-    addplot_list = []
-
-    # 如果有信号，添加矩形标记
-    if signals_df is not None and not signals_df.empty:
-        fig, axes = mpf.plot(df, type='candle', style=s, returnfig=True, figsize=(14, 8))
-        ax = axes[0]
-        
-        # 倒序遍历以免重叠遮挡太严重，或者只画最近的
-        for _, row in signals_df.tail(5).iterrows(): # 只画最近5个信号，避免图太花
-            start = row['start_highlight']
-            end = row['end_highlight']
+        # --- 策略1: 10天内出现两根涨停阳线 ---
+        # 滚动窗口检查
+        window_size = 10
+        for i in range(len(df) - window_size):
+            window = df.iloc[i : i + window_size]
+            window_ups = window[window['pct_change'] >= (threshold / 100.0)]
             
-            # 确保日期在数据范围内
-            if start < df.index[-1] and end > df.index[0]:
-                color = 'yellow' if row['type'] == '双涨停模式' else 'blue'
-                alpha = 0.2
+            if len(window_ups) >= 2:
+                # 取首根涨停
+                first_up = window_ups.index[0]
                 
-                # 使用 axvspan 绘制背景区域
-                ax.axvspan(start, end, color=color, alpha=alpha, label=row['type'])
+                # 检查是否重复 (防止同一次信号被重复记录)
+                already_added = any(r['trigger_date'] == first_up.date() and r['type'] == '双涨停模式' for r in results)
+                if already_added:
+                    continue
                 
-                # 在图上标注文字
-                ax.text(start, df.loc[start, 'High'] * 1.02, row['type'], fontsize=9, color=color)
+                # 观察期逻辑：首根次日 -> +13天
+                obs_start = first_up + timedelta(days=1)
+                obs_end = first_up + timedelta(days=13)
+                
+                if obs_start <= latest_date <= obs_end:
+                    results.append({
+                        'code': code,
+                        'name': name,
+                        'type': '🔥 双涨停模式',
+                        'trigger_date': first_up.date(),
+                        'days_into_pullback': (latest_date - first_up).days,
+                        'current_price': df.loc[latest_date, '收盘'],
+                        'obs_end_date': obs_end.date()
+                    })
+        
+        return results if results else None
 
-        st.pyplot(fig)
-    else:
-        fig, axes = mpf.plot(df, type='candle', style=s, returnfig=True, figsize=(14, 8))
-        st.pyplot(fig)
+    except Exception as e:
+        # 忽略个别股票数据错误，以免打断整体循环
+        return None
 
-# --- 主程序执行 ---
-if st.button("开始分析"):
-    data = get_stock_data(stock_code, start_date.strftime("%Y%m%d"), end_date.strftime("%Y%m%d"))
+# --- 程序主体 ---
+
+# 1. 获取股票列表
+stock_df = get_stock_list()
+
+if not stock_df.empty:
+    col1, col2 = st.columns([2, 1])
     
-    if data is not None:
-        st.subheader(f"股票代码: {stock_code} K线图")
+    if col1.button("🚀 开始全市场筛选", type="primary"):
+        # 初始化 Session State 存储结果
+        st.session_state['scan_results'] = []
+        st.session_state['scanning'] = True
         
-        signals = analyze_signals(data)
+    if st.session_state.get('scanning', False):
+        # 创建进度条
+        progress_bar = st.progress(0)
+        status_text = st.empty()
         
-        # 绘制图表
-        plot_chart(data, signals, stock_code)
+        all_results = []
+        total_stocks = len(stock_df)
         
-        # 显示信号列表
-        st.subheader("📅 发现的信号列表")
-        if signals is not None and not signals.empty:
-            # 优先显示双涨停模式
-            dual_mode = signals[signals['type'] == '双涨停模式']
-            single_mode = signals[signals['type'] == '单次涨停']
+        # 今天的日期字符串
+        today_str = datetime.now().strftime("%Y%m%d")
+        
+        # 遍历所有股票
+        # 注意：这里为了演示流畅性，会稍微限制每次请求的间隔
+        for index, row in stock_df.iterrows():
+            code = row['code']
+            name = row['name']
             
-            if not dual_mode.empty:
-                st.markdown("#### 🔴 重点：双涨停回调信号")
-                st.dataframe(dual_mode[['date', 'type', 'desc']].sort_values(by='date', ascending=False), use_container_width=True)
+            # 更新进度
+            progress = (index + 1) / total_stocks
+            progress_bar.progress(progress)
+            status_text.text(f"正在扫描: {name} ({code}) - 进度: {int(progress*100)}%")
             
-            if not single_mode.empty:
-                with st.expander("查看所有单次涨停信号"):
-                    st.dataframe(single_mode[['date', 'type', 'desc']].sort_values(by='date', ascending=False), use_container_width=True)
+            # 执行分析
+            res = analyze_single_stock(code, name, today_str, days_to_fetch, limit_threshold)
+            if res:
+                all_results.extend(res)
+            
+            # 稍微延时，防止请求过快被封 IP
+            time.sleep(0.05) 
+            
+        # 扫描完成
+        st.session_state['scanning'] = False
+        st.session_state['scan_results'] = all_results
+        progress_bar.empty()
+        status_text.text("扫描完成！")
+        
+        # 将结果存入 DataFrame
+        if all_results:
+            result_df = pd.DataFrame(all_results)
+            st.session_state['result_df'] = result_df
         else:
-            st.info("在选定时间范围内未发现符合条件的涨停信号。")
+            st.warning("未找到符合条件的目标股票。")
+
+# --- 结果展示 ---
+if 'scan_results' in st.session_state and st.session_state['scan_results']:
+    result_df = st.session_state['result_df']
+    
+    # 标签页展示
+    tab1, tab2 = st.tabs(["📊 筛选结果列表", "📈 详细K线图"])
+    
+    with tab1:
+        st.subheader(f"发现 {len(result_df)} 个符合观察条件的信号")
+        
+        # 分类展示
+        dual_mode = result_df[result_df['type'] == '🔥 双涨停模式']
+        single_mode = result_df[result_df['type'] == '单次涨停观察中']
+        
+        if not dual_mode.empty:
+            st.markdown("### 🔴 重点：双涨停回调观察")
+            st.dataframe(dual_mode.sort_values(by='days_into_pullback', ascending=True), use_container_width=True)
+            
+        if not single_mode.empty:
+            st.markdown("### 🔵 普通单涨停观察")
+            st.dataframe(single_mode.sort_values(by='days_into_pullback', ascending=True), use_container_width=True)
+            
+        # 全量下载
+        csv = result_df.to_csv(index=False).encode('utf-8')
+        st.download_button("下载CSV结果", csv, "stock_signals.csv", "text/csv")
+
+    with tab2:
+        st.subheader("查看个股详情")
+        # 股票选择器
+        stock_options = result_df.apply(lambda x: f"{x['name']} ({x['code']})", axis=1).tolist()
+        selected_stock = st.selectbox("选择一只股票查看K线", stock_options)
+        
+        if selected_stock:
+            # 提取代码
+            code = selected_stock.split('(')[1].split(')')[0]
+            
+            # 重新获取该股票数据画图 (复用之前的绘图逻辑，这里简化直接调用akshare)
+            try:
+                import mplfinance as mpf
+                import matplotlib.pyplot as plt
+                
+                plot_df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=(datetime.now()-timedelta(days=60)).strftime("%Y%m%d"), end_date=datetime.now().strftime("%Y%m%d"), adjust="qfq")
+                plot_df['日期'] = pd.to_datetime(plot_df['日期'])
+                plot_df.set_index('日期', inplace=True)
+                plot_df.rename(columns={'开盘':'Open', '最高':'High', '最低':'Low', '收盘':'Close', '成交量':'Volume'}, inplace=True)
+                
+                # 绘图
+                mc = mpf.make_marketcolors(up='r', down='g', edge='i', wick='i', volume='in', inherit=True)
+                s = mpf.make_mpf_style(marketcolors=mc, gridstyle='--')
+                
+                fig, axes = mpf.plot(plot_df, type='candle', style=s, returnfig=True, figsize=(14, 7))
+                st.pyplot(fig)
+                
+            except Exception as e:
+                st.error(f"绘图失败: {e}")
+
