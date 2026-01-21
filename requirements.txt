@@ -1,6 +1,5 @@
-        streamlit
-        akshare
-        mplfinance
-        pandas
-        matplotlib
-        
+streamlit
+pandas
+baostock
+openai
+openpyxl
