@@ -1,31 +1,48 @@
+import streamlit as st
 import baostock as bs
 import pandas as pd
 from datetime import datetime, timedelta
 
-def stock_screening_callback_logic():
-    # 1. 登录系统
-    lg = bs.login()
-    if lg.error_code != '0':
-        print(f"登录失败: {lg.error_msg}")
-        return
+# 设置页面配置
+st.set_page_config(page_title="单次涨停回调筛选", layout="wide")
 
-    # 设置回溯时间：取30个交易日以确保计算滑窗充足
+def stock_screening_streamlit():
+    st.title("📊 单次涨停回调 13 天筛选器")
+    st.write("规则：剔除 ST/创业板/科创板 | 13日内仅一次涨停 | 纯净表格版")
+
+    # 1. 登录系统
+    if 'bs_login' not in st.session_state:
+        lg = bs.login()
+        st.session_state['bs_login'] = lg
+
+    # 获取日期范围
     end_date = datetime.now().strftime("%Y-%m-%d")
     start_date = (datetime.now() - timedelta(days=45)).strftime("%Y-%m-%d")
 
-    print(f"正在筛选：13个交易日内仅有一次涨停的个股 (当前日期: {end_date})...")
+    # 2. 获取股票列表
+    with st.spinner('正在获取 A 股列表...'):
+        rs = bs.query_all_stock(day=end_date)
+        all_stocks = []
+        while (rs.error_code == '0') & rs.next():
+            all_stocks.append(rs.get_row_data())
+        
+        result_df = pd.DataFrame(all_stocks, columns=rs.fields)
 
-    # 2. 获取所有股票列表
-    rs = bs.query_all_stock(day=end_date)
-    all_stocks = []
-    while (rs.error_code == '0') & rs.next():
-        all_stocks.append(rs.get_row_data())
-    
-    result_df = pd.DataFrame(all_stocks, columns=rs.fields)
+    # 3. 核心筛选逻辑
     final_list = []
-
-    # 3. 遍历股票进行逻辑筛选
+    
+    # 增加进度条，解决页面“无内容”感
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    # 为了演示效率，这里先取前 200 只做示例，实际使用可去掉 [:200]
+    total_stocks = len(result_df)
+    
     for index, row in result_df.iterrows():
+        # 更新进度
+        progress = (index + 1) / total_stocks
+        progress_bar.progress(progress)
+        
         code = row['code']
         code_name = row['code_name']
 
@@ -35,11 +52,10 @@ def stock_screening_callback_logic():
         raw_code = code.split('.')[-1]
         if raw_code.startswith('300') or raw_code.startswith('688'):
             continue
-        # ---------------------------------------
 
-        # 获取历史K线数据
+        # 获取历史K线
         k_rs = bs.query_history_k_data_plus(
-            code, "date,code,close,preclose,pctChg",
+            code, "date,code,close,pctChg",
             start_date=start_date, end_date=end_date,
             frequency="d", adjustflag="3"
         )
@@ -48,48 +64,40 @@ def stock_screening_callback_logic():
         while (k_rs.error_code == '0') & k_rs.next():
             k_data.append(k_rs.get_row_data())
         
-        # 观察窗：至少需要14天（1天涨停 + 13天回调）
         if len(k_data) < 14:
             continue
 
         df_stock = pd.DataFrame(k_data, columns=k_rs.fields)
         df_stock['pctChg'] = pd.to_numeric(df_stock['pctChg'])
         
-        # --- 核心修改：仅保留单次涨停逻辑，剔除连阳限制 ---
         # 截取最近14个交易日
-        recent_window = df_stock.tail(14).copy()
+        recent_window = df_stock.tail(14)
         limit_up_mask = recent_window['pctChg'] >= 9.9
         limit_up_count = limit_up_mask.sum()
 
-        # 条件：这14天内有且仅有一次涨停
+        # 逻辑：有且仅有一次涨停
         if limit_up_count == 1:
-            # 找到那次涨停的索引位置
             limit_up_idx = recent_window[limit_up_mask].index[0]
-            # 计算涨停至今经过了多少个交易日
             days_passed = (len(df_stock) - 1) - limit_up_idx
             
             final_list.append({
                 "代码": code,
                 "名称": code_name,
                 "现价": recent_window.iloc[-1]['close'],
-                "今日涨幅": f"{recent_window.iloc[-1]['pctChg']}%",
+                "今日涨幅(%)": recent_window.iloc[-1]['pctChg'],
                 "距涨停已过天数": days_passed
             })
 
-    # 4. 输出结果
-    print("\n" + "="*65)
-    print(f"{'序号':^6} | {'代码':^10} | {'名称':^10} | {'距涨停天数':^10} | {'当前状态':^10}")
-    print("-" * 65)
-    
-    if final_list:
-        for i, item in enumerate(final_list, 1):
-            # 统一展示格式
-            print(f"{i:^8} | {item['代码']:^10} | {item['名称']:^10} | {item['距涨停已过天数']:^12} | {item['今日涨幅']:^12}")
-    else:
-        print("未发现符合“单次涨停+13日内回调”条件的股票。")
-    print("="*65)
+    # 4. 显示结果
+    status_text.text("筛选完成！")
+    progress_bar.empty()
 
-    bs.logout()
+    if final_list:
+        final_df = pd.DataFrame(final_list)
+        # 使用 Streamlit 的表格组件
+        st.dataframe(final_df, use_container_width=True)
+    else:
+        st.warning("当前市场未发现符合条件的股票。")
 
 if __name__ == "__main__":
-    stock_screening_callback_logic()
+    stock_screening_streamlit()
