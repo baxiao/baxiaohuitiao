@@ -1,4 +1,3 @@
 streamlit
-pandas
 baostock
-openpyxl
+pandas
