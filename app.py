@@ -4,108 +4,121 @@ import pandas as pd
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# 页面配置
-st.set_page_config(page_title="2026-01-14 序号居中稳定母版", layout="wide")
+st.set_page_config(page_title="单次涨停回调筛选-稳定版", layout="wide")
 
-def fetch_individual_stock(code, code_name, start_date, end_date):
-    """单个股票筛选逻辑"""
-    # 线程内再次检查登录状态，防止接口空跑
-    k_rs = bs.query_history_k_data_plus(
-        code, "date,code,close,pctChg",
-        start_date=start_date, end_date=end_date,
-        frequency="d", adjustflag="3"
-    )
-    
-    k_data = []
-    while (k_rs.error_code == '0') & k_rs.next():
-        k_data.append(k_rs.get_row_data())
-    
-    if len(k_data) < 5: # 至少要有数据
-        return None
+# 初始化 Baostock 登录 (全局只做一次)
+def init_bs():
+    if 'bs_login' not in st.session_state:
+        lg = bs.login()
+        if lg.error_code == '0':
+            st.session_state['bs_login'] = True
+            return True
+        return False
+    return True
 
-    df_stock = pd.DataFrame(k_data, columns=k_rs.fields)
-    df_stock['pctChg'] = pd.to_numeric(df_stock['pctChg'])
-    
-    # --- 逻辑微调：13天内出现过涨停即可（放宽仅一次的限制，更易出结果） ---
-    recent_window = df_stock.tail(13) 
-    limit_up_mask = recent_window['pctChg'] >= 9.8 # 考虑到四舍五入，设为9.8
-    
-    if limit_up_mask.any():
-        # 获取最后一次涨停的位置
-        last_limit_idx = recent_window[limit_up_mask].index[-1]
-        days_passed = (len(df_stock) - 1) - last_limit_idx
+def fetch_data(code, name, start_date, end_date):
+    """线程执行体：只负责抓取数据和逻辑判断"""
+    try:
+        # 注意：Baostock query 必须在 login 状态下，但在 ThreadPool 中共享主进程连接
+        rs = bs.query_history_k_data_plus(
+            code, "date,code,close,pctChg",
+            start_date=start_date, end_date=end_date,
+            frequency="d", adjustflag="3"
+        )
+        data_list = []
+        while (rs.error_code == '0') & rs.next():
+            data_list.append(rs.get_row_data())
         
-        return {
-            "代码": code,
-            "名称": code_name,
-            "最新价": recent_window.iloc[-1]['close'],
-            "今日涨幅(%)": f"{recent_window.iloc[-1]['pctChg']}%",
-            "距最近涨停天数": days_passed
-        }
+        if len(data_list) < 10: return None
+        
+        df = pd.DataFrame(data_list, columns=rs.fields)
+        df['pctChg'] = pd.to_numeric(df['pctChg'])
+        
+        # 核心逻辑：过去 14 天（含今天）
+        recent = df.tail(14)
+        # 涨停判定放宽至 9.7% 容错
+        limit_up_mask = recent['pctChg'] >= 9.7
+        
+        if limit_up_mask.sum() == 1:
+            last_idx = recent[limit_up_mask].index[0]
+            days_since = (len(df) - 1) - last_idx
+            return {
+                "代码": code, "名称": name, 
+                "现价": recent.iloc[-1]['close'], 
+                "今日涨幅": f"{recent.iloc[-1]['pctChg']}%",
+                "距涨停天数": days_since
+            }
+    except:
+        return None
     return None
 
 def main():
-    st.title("📊 单次涨停回调 13 天筛选器")
-    st.info("规则：剔除 ST/创业板/科创板 | 13日内有涨停 | 多线程稳定版")
+    st.title("📊 单次涨停回调筛选器 (稳定加速版)")
+    
+    if not init_bs():
+        st.error("Baostock 登录失败，请检查网络。")
+        return
 
-    # 初始化Baostock
-    if 'bs_login' not in st.session_state:
-        bs.login()
-        st.session_state['bs_login'] = True
-
-    # 按钮和下载区
-    if st.button("🚀 开始执行全市场筛选"):
+    # 控制区
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        run_btn = st.button("🚀 开始筛选全市场")
+    
+    if run_btn:
         end_date = datetime.now().strftime("%Y-%m-%d")
-        # 往前多取一点数据保证计算
-        start_date = (datetime.now() - timedelta(days=40)).strftime("%Y-%m-%d")
-
-        with st.spinner('正在拉取 A 股清单...'):
-            rs = bs.query_all_stock(day=end_date)
-            stock_list = []
-            while (rs.error_code == '0') & rs.next():
-                r_data = rs.get_row_data()
-                code, name = r_data[0], r_data[1]
-                raw_code = code.split('.')[-1]
-                # 母本过滤规则
-                if "ST" in name or "st" in name: continue
-                if raw_code.startswith('300') or raw_code.startswith('688'): continue
-                stock_list.append((code, name))
-
-        if not stock_list:
-            st.error("无法获取股票列表，请检查网络或Baostock接口状态。")
-            return
-
-        final_list = []
-        progress_bar = st.progress(0)
-        status_text = st.empty()
+        start_date = (datetime.now() - timedelta(days=45)).strftime("%Y-%m-%d")
         
-        # 使用 8 个线程比较稳妥，避免被服务器封禁
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            future_to_stock = {executor.submit(fetch_individual_stock, s[0], s[1], start_date, end_date): s for s in stock_list}
+        # 1. 获取清单
+        with st.spinner("获取 A 股清单中..."):
+            stock_rs = bs.query_all_stock(day=end_date)
+            raw_list = []
+            while (stock_rs.error_code == '0') & stock_rs.next():
+                raw_list.append(stock_rs.get_row_data())
+        
+        if not raw_list:
+            st.error("接口未返回股票列表，请尝试刷新页面重试。")
+            return
             
-            for i, future in enumerate(as_completed(future_to_stock)):
+        # 2. 预过滤 (ST/创业板/科创板)
+        filtered_stocks = []
+        for s in raw_list:
+            code, name = s[0], s[1]
+            if "ST" in name or "st" in name: continue
+            if code.split('.')[1].startswith(('300', '688')): continue
+            filtered_stocks.append((code, name))
+            
+        # 3. 多线程处理
+        final_results = []
+        progress_bar = st.progress(0)
+        status = st.empty()
+        
+        total = len(filtered_stocks)
+        # 线程数不宜过大，防止被封 IP
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(fetch_data, s[0], s[1], start_date, end_date): s for s in filtered_stocks}
+            
+            for i, future in enumerate(as_completed(futures)):
                 res = future.result()
                 if res:
-                    final_list.append(res)
+                    final_results.append(res)
                 
-                if i % 20 == 0:
-                    avg_progress = (i + 1) / len(stock_list)
-                    progress_bar.progress(avg_progress)
-                    status_text.text(f"已扫描 {i+1} 只股票...")
-
-        status_text.success(f"筛选完成！共发现 {len(final_list)} 只符合条件的股票。")
+                if i % 50 == 0:
+                    progress_bar.progress((i + 1) / total)
+                    status.text(f"已扫描 {i+1}/{total} 只个股...")
         
-        if final_list:
-            df_result = pd.DataFrame(final_list)
-            # 序号居中稳定显示
-            df_result.index = range(1, len(df_result) + 1)
-            st.dataframe(df_result, use_container_width=True)
+        status.success(f"扫描完毕！共发现 {len(final_results)} 只符合条件的股票。")
+        progress_bar.empty()
 
-            # 导出功能
-            csv = df_result.to_csv(index=True).encode('utf-8-sig')
-            st.download_button("📥 导出筛选结果为 CSV", csv, "result.csv", "text/csv")
+        # 4. 展示与导出
+        if final_results:
+            df = pd.DataFrame(final_results)
+            df.index = range(1, len(df) + 1) # 序号从1开始
+            st.dataframe(df, use_container_width=True)
+            
+            csv = df.to_csv(index=True).encode('utf-8-sig')
+            st.download_button("📥 导出 CSV 结果", csv, "stock_results.csv", "text/csv")
         else:
-            st.warning("满足条件的股票数为 0，建议检查近期市场是否有涨停个股。")
+            st.warning("满足『14天内仅1次涨停』条件的个股为 0，建议确认最近两周行情。")
 
 if __name__ == "__main__":
     main()
